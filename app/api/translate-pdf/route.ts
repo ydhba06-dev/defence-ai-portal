@@ -19,6 +19,26 @@ async function fetchFast(url: string) {
   }
 }
 
+async function generateWithFallback(prompt: string) {
+  const models = ['gemini-3.8-flash', 'gemini-3.8-flash-lite', 'gemini-3.8-pro'];
+  let lastError: any;
+
+  for (const model of models) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: { responseMimeType: 'application/json', temperature: 0.2 }
+      });
+      if (response.text) return response.text;
+    } catch (err: any) {
+      lastError = err;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw lastError;
+}
+
 async function runDailySync() {
   const [newsRes, arxivRes] = await Promise.all([
     fetchFast('https://news.google.com/rss/search?q=military+AI+OR+defense+AI&hl=en-US&gl=US&ceid=US:en'),
@@ -35,13 +55,8 @@ async function runDailySync() {
 [arXiv] ${arxivRes.slice(0, 1500)}
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: prompt,
-    config: { responseMimeType: 'application/json', temperature: 0.2 }
-  });
-
-  const rawText = (response.text || '[]').replace(/```json|```/g, '').trim();
+  const text = await generateWithFallback(prompt);
+  const rawText = text.replace(/```json|```/g, '').trim();
   const items = JSON.parse(rawText);
 
   if (Array.isArray(items) && items.length > 0) {
