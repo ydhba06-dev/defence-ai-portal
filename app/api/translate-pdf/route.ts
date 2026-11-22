@@ -8,48 +8,59 @@ const supabase = createClient(
 );
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
-export async function GET(request: Request) {
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
+export async function POST(request: Request) {
   try {
-    const [arxivRes, openAlexRes] = await Promise.all([
-      fetch('http://export.arxiv.org/api/query?search_query=all:military+OR+all:swarm+OR+all:command+and+control&sortBy=submittedDate&max_results=5'),
-      fetch('https://api.openalex.org/works?search=military+AI+command+control&sort=publication_date:desc&per-page=5')
-    ]);
+    const formData = await request.formData();
+    const file = formData.get('file') as File;
+    const origin = (formData.get('origin') as string) || '직접 업로드';
 
-    const arxivXml = await arxivRes.text();
-    const openAlexJson = await openAlexRes.json();
+    if (!file) {
+      return NextResponse.json({ error: 'PDF 파일이 없습니다.' }, { status: 400 });
+    }
 
-    const prompt = `
-    당신은 국방 AI 및 지휘결심체계(C2) 전문 인텔리전스 에이전트입니다.
-    아래 수집된 arXiv 및 OpenAlex 최신 학술 데이터를 바탕으로 한글 브리핑 JSON 배열을 생성하세요.
-    각 객체는 반드시 다음 필드를 가져야 합니다:
-    { "item_type": "NEWS" | "PAPER" | "GLOSSARY", "category": "분류명", "org": "기관/발행일", "title": "한글 제목", "oneliner": "1줄 요약", "body": ["문단1", "문단2", "문단3"], "source": "출처 및 arXiv/DOI 근거" }
-
-    - PAPER 5개 (초록·방법론·시사점 포함 한글 완역)
-    - GLOSSARY 5개 (핵심 정책·기술 용어 해설)
-    [원시 데이터]
-    arXiv: ${arxivXml.slice(0, 8000)}
-    OpenAlex: ${JSON.stringify(openAlexJson.results?.slice(0, 5) || []).slice(0, 6000)}
-    `;
+    const arrayBuffer = await file.arrayBuffer();
+    const base64Pdf = Buffer.from(arrayBuffer).toString('base64');
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: prompt,
+      contents: [
+        {
+          inlineData: { mimeType: 'application/pdf', data: base64Pdf }
+        },
+        `이 학술 논문 PDF를 읽고 완벽한 한국어로 구조화하여 JSON으로 반환하세요.
+        필수 JSON 형식:
+        {
+          "title": "한글 번역 논문 제목",
+          "oneliner": "핵심 기여 1줄 요약",
+          "sections": {
+            "abstract": "초록 한글 완역",
+            "intro": "서론 및 문제 정의 요약",
+            "method": "핵심 아키텍처·알고리즘·수식 해설",
+            "results": "실험 설계 및 주요 정량 결과 요약",
+            "conclusion": "결론 및 국방/전술적 시사점"
+          }
+        }`
+      ],
       config: { responseMimeType: 'application/json', temperature: 0.2 }
     });
 
-    const items = JSON.parse(response.text || '[]');
-    if (Array.isArray(items) && items.length > 0) {
-      await supabase.from('daily_items').insert(items);
-    }
+    const parsed = JSON.parse(response.text || '{}');
 
-    return NextResponse.json({ status: 'ok', inserted: items.length });
+    const { data, error } = await supabase
+      .from('personal_library')
+      .insert({
+        file_name: file.name,
+        title: parsed.title || file.name,
+        oneliner: parsed.oneliner || 'PDF 분석 완료',
+        sections: parsed.sections || {},
+        source_origin: origin
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return NextResponse.json({ status: 'ok', item: data });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
-
