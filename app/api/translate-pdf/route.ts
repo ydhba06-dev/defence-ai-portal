@@ -22,7 +22,7 @@ export async function POST(request: Request) {
     const base64Pdf = Buffer.from(arrayBuffer).toString('base64');
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: [
         {
           inlineData: { mimeType: 'application/pdf', data: base64Pdf }
