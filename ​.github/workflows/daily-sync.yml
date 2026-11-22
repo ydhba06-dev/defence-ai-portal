@@ -1,1 +1,123 @@
+name: Daily Defense AI Briefing (07:00 KST)
+
+on:
+  schedule:
+    # 매일 한국시간(KST) 오전 7시 (UTC 22:00) 자동 실행
+    - cron: '0 22 * * *'
+  workflow_dispatch: # 필요할 때 GitHub에서 수동 1클릭 실행 가능
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Daily Briefing Sync
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          node -e '
+          async function fetchSafe(url, isJson = false) {
+            try {
+              const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+              return isJson ? await res.json() : await res.text();
+            } catch {
+              return isJson ? { results: [] } : "";
+            }
+          }
+
+          async function callGeminiWithRetry(prompt) {
+            const models = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"];
+            for (let attempt = 1; attempt <= 5; attempt++) {
+              for (const model of models) {
+                try {
+                  console.log(`[시도 ${attempt}/5] 모델 호출: ${model}`);
+                  const res = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+                      })
+                    }
+                  );
+                  const data = await res.json();
+                  if (res.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
+                    console.log(`성공! (${model})`);
+                    return data.candidates[0].content.parts[0].text;
+                  }
+                  console.log(`실패 (${model}):`, data.error?.message || res.status);
+                } catch (e) {
+                  console.log(`에러 (${model}):`, e.message);
+                }
+              }
+              console.log("15초 대기 후 재시도합니다...");
+              await new Promise(r => setTimeout(r, 15000));
+            }
+            throw new Error("모든 재시도 실패");
+          }
+
+          async function main() {
+            const [newsRes, arxivRes, openAlexRes] = await Promise.all([
+              fetchSafe("https://news.google.com/rss/search?q=military+AI+OR+defense+AI+OR+CJADC2+OR+drone+swarm&hl=en-US&gl=US&ceid=US:en"),
+              fetchSafe("https://export.arxiv.org/api/query?search_query=all:military+OR+all:swarm+OR+all:command+and+control&sortBy=submittedDate&max_results=5"),
+              fetchSafe("https://api.openalex.org/works?search=military+AI+command+control&sort=publication_date:desc&per-page=5", true)
+            ]);
+
+            const prompt = `
+          당신은 국방 AI 및 지휘결심체계(C2) 전문 인텔리전스 에이전트입니다.
+          아래 수집된 최신 뉴스(Google News RSS), arXiv, OpenAlex 원시 데이터를 바탕으로 한글 브리핑 JSON 배열을 생성하세요.
+          반드시 순수 JSON 배열만 출력하고, 각 객체는 아래 필드를 정확히 포함해야 합니다:
+          {
+            "item_type": "NEWS" | "PAPER" | "GLOSSARY",
+            "category": "분류명 (예: AI 지휘결심체계, 최신 AI 기술, 학술논문, 핵심용어)",
+            "org": "기관명 또는 매체명 · 발행일",
+            "title": "한글 번역 제목",
+            "oneliner": "핵심 1줄 요약",
+            "body": ["문단1 (상세 내용)", "문단2 (기술/전술적 맥락)", "문단3 (국방/전술적 시사점)"],
+            "source": "출처 및 근거 (매체명, 저자, arXiv ID 또는 DOI)"
+          }
+
+          생성 개수 (총 12개):
+          - NEWS 4개 (수집된 최신 국방·AI 뉴스 한글 완역 및 시사점)
+          - PAPER 4개 (수집된 arXiv/OpenAlex 논문 초록·방법론·시사점 한글 완역)
+          - GLOSSARY 4개 (위 기사와 논문에 등장하는 핵심 정책·기술 용어 해설)
+
+          [원시 데이터]
+          News RSS: ${String(newsRes).slice(0, 6000)}
+          arXiv: ${String(arxivRes).slice(0, 6000)}
+          OpenAlex: ${JSON.stringify(openAlexRes?.results?.slice(0, 5) || []).slice(0, 4000)}
+          `;
+
+            const rawText = (await callGeminiWithRetry(prompt)).replace(/```json|```/g, "").trim();
+            const items = JSON.parse(rawText);
+
+            if (!Array.isArray(items) || items.length === 0) {
+              throw new Error("생성된 항목이 없습니다.");
+            }
+
+            const sbRes = await fetch(`${process.env.SUPABASE_URL}/rest/v1/daily_items`, {
+              method: "POST",
+              headers: {
+                "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal"
+              },
+              body: JSON.stringify(items)
+            });
+
+            if (!sbRes.ok) {
+              throw new Error("Supabase 저장 실패: " + await sbRes.text());
+            }
+            console.log(`완료! 총 ${items.length}건 저장됨.`);
+          }
+
+          main().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          '
 
